@@ -106,6 +106,8 @@ uint64_t open(char *filename, uint64_t flags, ...);
 // selfie bootstraps void* to uint64_t* and unsigned to uint64_t!
 void *malloc(unsigned long);
 
+uint64_t get_pid();
+
 // selfie bootstraps the following *printf procedures
 int printf(const char *format, ...);
 int sprintf(char *str, const char *format, ...);
@@ -1299,6 +1301,9 @@ void emit_malloc();
 uint64_t try_brk(uint64_t *context, uint64_t new_program_break);
 void implement_brk(uint64_t *context);
 
+void emit_get_pid();
+void implement_get_pid(uint64_t *context);
+
 uint64_t is_boot_level_zero();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
@@ -1313,6 +1318,7 @@ uint64_t SYSCALL_READ = 63;
 uint64_t SYSCALL_WRITE = 64;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK = 214;
+uint64_t SYSCALL_ID = 170;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2241,11 +2247,12 @@ uint64_t *delete_context(uint64_t *context, uint64_t *from);
 // | 30 | gcs counter     | number of gc runs in gc period
 // | 31 | gc enabled      | flag indicating whether to use gc or not
 // +----+-----------------+
+// | 32 | id              | process id
 
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 32;
+uint64_t CONTEXTENTRIES = 33;
 
 uint64_t *allocate_context(); // declaration avoids warning in the Boehm garbage collector
 
@@ -2289,6 +2296,7 @@ uint64_t used_list_head(uint64_t *context) { return (uint64_t)(context + 28); }
 uint64_t free_list_head(uint64_t *context) { return (uint64_t)(context + 29); }
 uint64_t gcs_in_period(uint64_t *context) { return (uint64_t)(context + 30); }
 uint64_t use_gc_kernel(uint64_t *context) { return (uint64_t)(context + 31); }
+uint64_t id(uint64_t *context) { return (uint64_t)(context + 32); }
 
 uint64_t *get_next_context(uint64_t *context) { return (uint64_t *)*context; }
 uint64_t *get_prev_context(uint64_t *context) { return (uint64_t *)*(context + 1); }
@@ -2324,6 +2332,7 @@ uint64_t *get_used_list_head(uint64_t *context) { return (uint64_t *)*(context +
 uint64_t *get_free_list_head(uint64_t *context) { return (uint64_t *)*(context + 29); }
 uint64_t get_gcs_in_period(uint64_t *context) { return *(context + 30); }
 uint64_t get_use_gc_kernel(uint64_t *context) { return *(context + 31); }
+uint64_t get_id(uint64_t *context) { return *(context + 32); }
 
 void set_next_context(uint64_t *context, uint64_t *next) { *context = (uint64_t)next; }
 void set_prev_context(uint64_t *context, uint64_t *prev) { *(context + 1) = (uint64_t)prev; }
@@ -2359,6 +2368,7 @@ void set_used_list_head(uint64_t *context, uint64_t *used_list_head) { *(context
 void set_free_list_head(uint64_t *context, uint64_t *free_list_head) { *(context + 29) = (uint64_t)free_list_head; }
 void set_gcs_in_period(uint64_t *context, uint64_t gcs) { *(context + 30) = gcs; }
 void set_use_gc_kernel(uint64_t *context, uint64_t use) { *(context + 31) = use; }
+void set_id(uint64_t *context, uint64_t new_pid) { *(context + 32) = new_pid; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -2401,6 +2411,7 @@ uint64_t *current_context = (uint64_t *)0; // context currently running
 uint64_t *used_contexts = (uint64_t *)0; // doubly-linked list of used contexts
 uint64_t *free_contexts = (uint64_t *)0; // singly-linked list of free contexts
 
+uint64_t gen_id = 0; // general autoincremente id for processes
 // ------------------------- INITIALIZATION ------------------------
 
 void reset_microkernel()
@@ -2452,6 +2463,7 @@ char *increment_boot_level_prefix(char *s, char *t);
 void boot_loader(uint64_t *context);
 
 uint64_t selfie_run(uint64_t machine);
+uint64_t selfie_run_mipsterOS(uint64_t machine);
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
 
@@ -6846,6 +6858,7 @@ void selfie_compile()
   emit_malloc();
 
   emit_switch();
+  emit_get_pid();
 
   if (GC_ON)
   {
@@ -8207,6 +8220,26 @@ void implement_exit(uint64_t *context)
 
   set_exit_code(context, sign_shrink(signed_int_exit_code, SYSCALL_BITWIDTH));
 }
+
+void emit_get_pid()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("get_pid"),
+                            0, PROCEDURE, UINT64_T, 0, code_size);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_ID);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_get_pid(uint64_t *context)
+{
+  *(get_regs(context)+REG_A0) = get_id(context);
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+}
+
+
 
 void emit_read()
 {
@@ -10893,18 +10926,24 @@ void do_ecall()
   {
     read_register(REG_A0);
 
-    if (*(registers + REG_A7) != SYSCALL_EXIT)
+    if (*(registers + REG_A7) != SYSCALL_ID)
     {
-      if (*(registers + REG_A7) != SYSCALL_BRK)
-      {
-        read_register(REG_A1);
-        read_register(REG_A2);
-
-        if (*(registers + REG_A7) == SYSCALL_OPENAT)
-          read_register(REG_A3);
-      }
-
       write_register(REG_A0);
+    } else 
+    {
+      if (*(registers + REG_A7) != SYSCALL_EXIT)
+      {
+        if (*(registers + REG_A7) != SYSCALL_BRK)
+        {
+          read_register(REG_A1);
+          read_register(REG_A2);
+
+          if (*(registers + REG_A7) == SYSCALL_OPENAT)
+            read_register(REG_A3);
+        }
+
+        write_register(REG_A0);
+      }
     }
 
     // all system calls other than switch are handled by exception
@@ -11844,21 +11883,24 @@ void print_profile()
 
   printf("%s: --------------------------------------------------------------------------------\n", selfie_name);
   printf("%s: summary: ", selfie_name);
-  if (get_total_number_of_instructions() > 0)
+  if (0==1)
   {
-    printf("%lu executed instructions in total [%lu.%.2lu%% nops]\n",
-           get_total_number_of_instructions(),
-           percentage_format_integral_2(get_total_number_of_instructions(), get_total_number_of_nops()),
-           percentage_format_fractional_2(get_total_number_of_instructions(), get_total_number_of_nops()));
-    printf("%s:          ", selfie_name);
+    if (get_total_number_of_instructions() > 0)
+    {
+      printf("%lu executed instructions in total [%lu.%.2lu%% nops]\n",
+            get_total_number_of_instructions(),
+            percentage_format_integral_2(get_total_number_of_instructions(), get_total_number_of_nops()),
+            percentage_format_fractional_2(get_total_number_of_instructions(), get_total_number_of_nops()));
+      printf("%s:          ", selfie_name);
+    }
+    printf("%lu.%.2luMB mapped memory [%lu.%.2lu%% of %luMB physical memory]\n",
+          ratio_format_integral_2(pused(), MEGABYTE),
+          ratio_format_fractional_2(pused(), MEGABYTE),
+          percentage_format_integral_2(PHYSICALMEMORYSIZE, pused()),
+          percentage_format_fractional_2(PHYSICALMEMORYSIZE, pused()),
+          PHYSICALMEMORYSIZE / MEGABYTE);
   }
-  printf("%lu.%.2luMB mapped memory [%lu.%.2lu%% of %luMB physical memory]\n",
-         ratio_format_integral_2(pused(), MEGABYTE),
-         ratio_format_fractional_2(pused(), MEGABYTE),
-         percentage_format_integral_2(PHYSICALMEMORYSIZE, pused()),
-         percentage_format_fractional_2(PHYSICALMEMORYSIZE, pused()),
-         PHYSICALMEMORYSIZE / MEGABYTE);
-
+  
   down_load_profiles();
 
   context = used_contexts;
@@ -12020,7 +12062,8 @@ void init_context(uint64_t *context, uint64_t *parent, uint64_t *vctxt)
     // pointing to 4KB leaf nodes (page tables) that
     // each accommodate 2^9 (2^12 / 2^3) leaf PTEs
     set_pt(context, zmalloc(NUMBEROFPAGES / NUMBEROFLEAFPTES * sizeof(uint64_t *)));
-
+  
+  set_id(context, gen_id); gen_id = gen_id+1;
   // reset page table cache
   set_lowest_lo_page(context, 0);
   set_highest_lo_page(context, get_lowest_lo_page(context));
@@ -12695,7 +12738,8 @@ uint64_t handle_system_call(uint64_t *context)
 
     // TODO: exit only if all contexts have exited
     return EXIT;
-  }
+  } else if (a7 == SYSCALL_ID)
+    implement_get_pid(context);
   else
   {
     printf("%s: unknown system call %lu\n", selfie_name, a7);
@@ -13228,6 +13272,104 @@ uint64_t selfie_run(uint64_t machine)
   return exit_code;
 }
 
+
+
+uint64_t selfie_run_mipsterOS(uint64_t machine)
+{
+  uint64_t exit_code;
+  uint64_t number;
+
+  if (code_size == 0)
+  {
+    printf("%s: nothing to run, debug, or host\n", selfie_name);
+
+    return EXITCODE_BADARGUMENTS;
+  }
+  else if (machine == HYPSTER)
+  {
+    if (OS != SELFIE)
+    {
+      printf("%s: hypster only runs on mipster\n", selfie_name);
+
+      return EXITCODE_BADARGUMENTS;
+    }
+  }
+
+  reset_interpreter();
+  reset_profiler();
+  reset_microkernel();
+
+  init_memory(atoi(peek_argument(0)));
+  number = atoi(peek_argument(0));
+
+  while (number>0){
+    current_context = create_context(MY_CONTEXT, 0);
+    boot_loader(current_context);
+    number = number-1;
+  }
+  
+
+  run = 1;
+
+  printf("%s: %lu-bit %s executing %lu-bit RISC-U binary %s with %luMB physical memory", selfie_name,
+         SIZEOFUINT64INBITS,
+         (char *)*(MACHINES + machine),
+         WORDSIZEINBITS,
+         binary_name,
+         PHYSICALMEMORYSIZE / MEGABYTE);
+
+  if (GC_ON)
+  {
+    gc_init(current_context);
+
+    printf(", gcing every %lu mallocs, ", GC_PERIOD);
+    if (GC_REUSE)
+      printf("reusing memory");
+    else
+      printf("not reusing memory");
+  }
+
+  if (debug)
+  {
+    if (record)
+      printf(", and replay");
+    else
+      printf(", and debugger");
+  }
+
+  printf("\n%s: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n\n", selfie_name);
+
+  if (machine == MIPSTER)
+    exit_code = mipster(current_context);
+  else if (machine == HYPSTER)
+    exit_code = hypster(current_context);
+  else
+    exit_code = 0;
+
+  printf("\n%s: <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n", selfie_name);
+
+  printf("%s: %lu-bit %s terminating %lu-bit RISC-U binary %s with exit code %ld\n", selfie_name,
+         SIZEOFUINT64INBITS,
+         (char *)*(MACHINES + machine),
+         WORDSIZEINBITS,
+         binary_name,
+         sign_extend(exit_code, SYSCALL_BITWIDTH));
+
+  print_profile();
+
+  run = 0;
+
+  record = 0;
+
+  debug_syscalls = 0;
+  debug = 0;
+
+  printf("%s: ################################################################################\n", selfie_name);
+
+  return exit_code;
+}
+
+
 // -----------------------------------------------------------------
 // ------------------- CONSOLE ARGUMENT SCANNER --------------------
 // -----------------------------------------------------------------
@@ -13335,6 +13477,8 @@ uint64_t selfie(uint64_t extras)
       {
         if (string_compare(argument, "-m"))
           return selfie_run(MIPSTER);
+        else if (string_compare(argument, "-x")) 
+          return selfie_run_mipsterOS(MIPSTER);
         else if (string_compare(argument, "-d"))
           return selfie_run(DIPSTER);
         else if (string_compare(argument, "-r"))
