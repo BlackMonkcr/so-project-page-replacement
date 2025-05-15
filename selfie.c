@@ -10926,7 +10926,7 @@ void do_ecall()
   {
     read_register(REG_A0);
 
-    if (*(registers + REG_A7) != SYSCALL_ID)
+    if (*(registers + REG_A7) == SYSCALL_ID)
     {
       write_register(REG_A0);
     } else 
