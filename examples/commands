@@ -2,9 +2,9 @@ Para probar el ejemplo de la guía:
 ./selfie -c "examples/hello-world.c" -x 2
 
 Para testear el funcionamiento esperado - ejercicio 1:
-./selfie -c "examples/lock/hello-world_without_lock.c" -x 5
-./selfie -c "examples/lock/hello-world_with_lock.c" -x 5
+./selfie -c "examples/hello-world_without_lock.c" -x 5
+./selfie -c "examples/hello-world_with_lock.c" -x 5
 
 Para testear el funcionamiento esperado - ejercicio 2:
-./selfie -c "examples/lock/race_condition_without_lock.c" -x 10
-./selfie -c "examples/lock/race_condition_with_lock.c" -x 10
+./selfie -c "examples/race_condition_without_lock.c" -x 10
+./selfie -c "examples/race_condition_with_lock.c" -x 10

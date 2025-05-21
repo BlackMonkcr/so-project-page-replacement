@@ -3,7 +3,6 @@ void exit(int exit_code);
 uint64_t write(uint64_t fd, uint64_t* buffer, uint64_t bytes_to_write);
 
 uint64_t fork();
-uint64_t wait(uint64_t* wstatus);
 
 uint64_t sizeof_uint64 = 8;
 uint64_t number_of_forks = 3;
@@ -65,11 +64,7 @@ void parallel_print(uint64_t depth) {
     // parallel_print here is called 2 times
     parallel_print(depth + 1);
 
-    // wait for the forked child
-    if (i_am_parent(depth))
-      wait(0);
-    else
-      exit(0);
+    exit(0);
   }
 }
 
