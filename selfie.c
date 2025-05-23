@@ -8219,6 +8219,8 @@ void implement_exit(uint64_t *context)
   signed_int_exit_code = *(get_regs(context) + REG_A0);
 
   set_exit_code(context, sign_shrink(signed_int_exit_code, SYSCALL_BITWIDTH));
+
+  used_contexts = delete_context (context, used_contexts);
 }
 
 void emit_get_pid()
@@ -12736,8 +12738,8 @@ uint64_t handle_system_call(uint64_t *context)
   {
     implement_exit(context);
 
-    // TODO: exit only if all contexts have exited
-    return EXIT;
+    if (used_contexts == (uint64_t *) 0)
+		return EXIT;
   } else if (a7 == SYSCALL_ID)
     implement_get_pid(context);
   else
