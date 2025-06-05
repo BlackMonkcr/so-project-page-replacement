@@ -297,6 +297,8 @@ uint64_t output_fd = 1; // standard output file descriptor
 char *output_buffer = (char *)0;
 uint64_t output_cursor = 0; // cursor for output buffer
 
+uint64_t SCHED_CLASS = (uint64_t)0; // RR as default
+uint64_t LOCK_OWNER = (uint64_t)-1; 
 // ------------------------- INITIALIZATION ------------------------
 
 void init_library()
@@ -480,6 +482,7 @@ uint64_t MAX_IDENTIFIER_LENGTH = 64; // maximum number of characters in an ident
 uint64_t MAX_INTEGER_LENGTH = 20;    // maximum number of characters in an unsigned integer
 uint64_t MAX_STRING_LENGTH = 128;    // maximum number of characters in a string
 
+uint64_t DEFAULT_LOCK_OWNER = (uint64_t)-1;
 // ------------------------ GLOBAL VARIABLES -----------------------
 
 char character; // most recently read character
@@ -1304,6 +1307,18 @@ void implement_brk(uint64_t *context);
 void emit_get_pid();
 void implement_get_pid(uint64_t *context);
 
+void emit_sched();
+void implement_sched(uint64_t *context);
+
+void emit_fork();
+void implement_fork(uint64_t *context);
+
+void emit_lock();
+void implement_lock(uint64_t *context);
+
+void emit_unlock();
+void implement_unlock(uint64_t *context);
+
 uint64_t is_boot_level_zero();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
@@ -1319,6 +1334,10 @@ uint64_t SYSCALL_WRITE = 64;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK = 214;
 uint64_t SYSCALL_ID = 170;
+uint64_t SYSCALL_SCHED = 27;
+uint64_t SYSCALL_FORK = 23;
+uint64_t SYSCALL_LOCK = 31;
+uint64_t SYSCALL_UNLOCK = 32;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2248,11 +2267,12 @@ uint64_t *delete_context(uint64_t *context, uint64_t *from);
 // | 31 | gc enabled      | flag indicating whether to use gc or not
 // +----+-----------------+
 // | 32 | id              | process id
+// | 33 | ptr_parent      | pointer to parent
 
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 33;
+uint64_t CONTEXTENTRIES = 34;
 
 uint64_t *allocate_context(); // declaration avoids warning in the Boehm garbage collector
 
@@ -2297,6 +2317,7 @@ uint64_t free_list_head(uint64_t *context) { return (uint64_t)(context + 29); }
 uint64_t gcs_in_period(uint64_t *context) { return (uint64_t)(context + 30); }
 uint64_t use_gc_kernel(uint64_t *context) { return (uint64_t)(context + 31); }
 uint64_t id(uint64_t *context) { return (uint64_t)(context + 32); }
+uint64_t ptr_parent(uint64_t *context) { return (uint64_t)(context + 33); }
 
 uint64_t *get_next_context(uint64_t *context) { return (uint64_t *)*context; }
 uint64_t *get_prev_context(uint64_t *context) { return (uint64_t *)*(context + 1); }
@@ -2332,7 +2353,9 @@ uint64_t *get_used_list_head(uint64_t *context) { return (uint64_t *)*(context +
 uint64_t *get_free_list_head(uint64_t *context) { return (uint64_t *)*(context + 29); }
 uint64_t get_gcs_in_period(uint64_t *context) { return *(context + 30); }
 uint64_t get_use_gc_kernel(uint64_t *context) { return *(context + 31); }
+
 uint64_t get_id(uint64_t *context) { return *(context + 32); }
+uint64_t* get_ptr_parent(uint64_t *context) { return (uint64_t *)*(context + 33); }
 
 void set_next_context(uint64_t *context, uint64_t *next) { *context = (uint64_t)next; }
 void set_prev_context(uint64_t *context, uint64_t *prev) { *(context + 1) = (uint64_t)prev; }
@@ -2368,7 +2391,9 @@ void set_used_list_head(uint64_t *context, uint64_t *used_list_head) { *(context
 void set_free_list_head(uint64_t *context, uint64_t *free_list_head) { *(context + 29) = (uint64_t)free_list_head; }
 void set_gcs_in_period(uint64_t *context, uint64_t gcs) { *(context + 30) = gcs; }
 void set_use_gc_kernel(uint64_t *context, uint64_t use) { *(context + 31) = use; }
+
 void set_id(uint64_t *context, uint64_t new_pid) { *(context + 32) = new_pid; }
+void set_ptr_parent(uint64_t *context, uint64_t* parent) { *(context + 33) = (uint64_t)parent; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -6860,6 +6885,12 @@ void selfie_compile()
   emit_switch();
   emit_get_pid();
 
+  emit_sched();
+
+  emit_fork();
+  emit_lock();
+  emit_unlock();
+
   if (GC_ON)
   {
     emit_fetch_stack_pointer();
@@ -8241,6 +8272,151 @@ void implement_get_pid(uint64_t *context)
   set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
 }
 
+
+void emit_sched()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("sched_class"),
+                            0, PROCEDURE, VOID_T, 1, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // new value for SCHED_CLASS
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_SCHED);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_sched(uint64_t *context)
+{
+  SCHED_CLASS = *(get_regs(context)+REG_A0);
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+}
+
+void emit_lock()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("lock"),
+                            0, PROCEDURE, VOID_T, 0, code_size);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_LOCK);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+
+void emit_fork(){
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("fork"),
+                            0, PROCEDURE, UINT64_T, 0, code_size);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_FORK);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+
+void implement_fork(uint64_t *context){
+  uint64_t *child_c;
+  uint64_t *parent_regs;
+  uint64_t *child_regs;
+  uint64_t it;
+  uint64_t bgn;
+  uint64_t end;
+  uint64_t *parent_pt;
+
+  // 1. new context 
+  child_c = create_context(MY_CONTEXT, 0);
+  set_lowest_lo_page(child_c, get_lowest_lo_page(context));
+  set_highest_lo_page(child_c, get_highest_lo_page(context));
+  set_lowest_hi_page(child_c, get_lowest_hi_page(context));
+  set_highest_hi_page(child_c, get_highest_hi_page(context));
+
+  set_code_seg_start(child_c, get_code_seg_start(context));
+  set_code_seg_size(child_c, get_code_seg_size(context));
+  
+  set_data_seg_start(child_c, get_data_seg_start(context));
+  set_data_seg_size(child_c, get_data_seg_size(context));
+
+  set_heap_seg_start(child_c, get_heap_seg_start(context));
+  set_program_break(child_c, get_program_break(context));
+
+  set_exception(child_c, get_exception(context));
+  set_fault(child_c, get_fault(context));
+  set_exit_code(child_c, get_exit_code(context));
+
+  // 2. copy registers and pc
+  parent_regs = get_regs(context);
+  child_regs = get_regs(child_c);
+  it = 0;
+  while (it<NUMBEROFREGISTERS){
+    *(child_regs+it) = *(parent_regs+it);
+    it = it+1;
+  }
+
+  set_pc(context, get_pc(context)+INSTRUCTIONSIZE);
+  set_pc(child_c, get_pc(context));
+
+  // 3. deep copy
+  parent_pt = get_pt(context);
+  bgn = get_code_seg_start(context);
+  end = get_program_break(context);
+  while (bgn<end){
+    if (is_virtual_address_mapped(parent_pt, bgn))
+      map_and_store(child_c, bgn, load_virtual_memory(parent_pt, bgn));
+    bgn = bgn + WORDSIZE;
+  }
+  
+  bgn = get_virtual_address_of_page_start(get_lowest_hi_page(context));
+  end = HIGHESTVIRTUALADDRESS;
+  while (bgn<end){
+    if (is_virtual_address_mapped(parent_pt, bgn))
+      map_and_store(child_c, bgn, load_virtual_memory(parent_pt, bgn));
+    bgn = bgn + WORDSIZE;
+  }
+
+
+  // 4. values for return
+  *(child_regs+REG_A0) = 0; // return for child is 0
+  *(parent_regs+REG_A0) = get_id(child_c); // return for parent is child's id
+
+  set_ptr_parent(child_c, context);
+}
+
+
+void implement_lock(uint64_t *context)
+{
+  if (LOCK_OWNER == DEFAULT_LOCK_OWNER)
+  {
+    LOCK_OWNER = get_id(context);
+    set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+  }
+}
+
+void emit_unlock()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("unlock"),
+                            0, PROCEDURE, VOID_T, 0, code_size);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_UNLOCK);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+
+void implement_unlock(uint64_t *context)
+{
+  if (LOCK_OWNER == get_id(context))
+  {
+    LOCK_OWNER = DEFAULT_LOCK_OWNER;
+  }
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+}
 
 
 void emit_read()
@@ -10931,7 +11107,16 @@ void do_ecall()
     if (*(registers + REG_A7) == SYSCALL_ID)
     {
       write_register(REG_A0);
-    } else 
+    } else if (*(registers + REG_A7) == SYSCALL_FORK){
+      write_register(REG_A0);
+    }
+    else if (*(registers + REG_A7) == SYSCALL_LOCK){}
+    else if (*(registers + REG_A7) == SYSCALL_UNLOCK){}
+    else if (*(registers + REG_A7) == SYSCALL_SCHED)
+    {
+      write_register(REG_A0);
+    }
+    else 
     {
       if (*(registers + REG_A7) != SYSCALL_EXIT)
       {
@@ -12742,6 +12927,14 @@ uint64_t handle_system_call(uint64_t *context)
 		return EXIT;
   } else if (a7 == SYSCALL_ID)
     implement_get_pid(context);
+  else if (a7 == SYSCALL_FORK)
+    implement_fork(context);
+  else if (a7 == SYSCALL_LOCK)
+    implement_lock(context);
+  else if (a7 == SYSCALL_UNLOCK)
+    implement_unlock(context);
+  else if (a7 == SYSCALL_SCHED)
+    implement_sched(context);
   else
   {
     printf("%s: unknown system call %lu\n", selfie_name, a7);
@@ -12852,6 +13045,9 @@ uint64_t mipster(uint64_t *to_context)
   {
     from_context = mipster_switch(to_context, timeout);
 
+    to_context = get_next_context(from_context); // this works for RR.
+    // Also, could work for priority scheduler if the list of processes is ordered
+
     if (get_parent(from_context) != MY_CONTEXT)
     {
       // switch to parent which is in charge of handling exceptions
@@ -12863,9 +13059,15 @@ uint64_t mipster(uint64_t *to_context)
       return get_exit_code(from_context);
     else
     {
-      to_context = get_next_context(from_context);
-      if (to_context == (uint64_t *)0)
-        to_context = used_contexts;
+      if (SCHED_CLASS == (uint64_t)0)
+      {
+        //to_context = get_next_context(from_context);
+        if (to_context == (uint64_t *)0)
+          to_context = used_contexts;
+      } else 
+      { // when is Priority Scheduler
+
+      }
 
       timeout = TIMESLICE;
     }

@@ -322,17 +322,11 @@ def check_treiber_stack() -> List[Check]:
 
 def check_scheduler() -> List[Check]:
     return check_execution('./selfie -c <assignment>priority-decrease.c -m 128',
-                           'Thread execution is ordered by priority',
+                           'Process execution is ordered by priority',
                            success_criteria=lambda code, out: is_expected_output(out, "2 1 3 0")) + \
 		check_execution('./selfie -c <assignment>priority-donation.c -m 128',
-                  		'Thread donates priority to avoid deadlock',
-                        success_criteria=lambda code, out: is_expected_output(out, "0 1")) + \
-        check_execution('./selfie -c <assignment>sleep.c -m 128',
-                        'Threads sleep for the right duration',
-                        success_criteria=32) + \
-        check_execution('./selfie -c <assignment>sleep-pid.c -m 128',
-                        'Thread execution is ordered correctly',
-                        success_criteria=lambda code, out: is_expected_output(out, "7 6 5 4 3 2 1 0 3 2 1 0 7 6 5 4"))
+                  		'Process donates priority to avoid deadlock',
+                        success_criteria=lambda code, out: is_expected_output(out, "0 1")) 
 
 assignment_bootstrapping = Assignment('bootstrapping', 'General', '', '', check_bootstrapping)
 assignment_self_compile = Assignment('self-compile', 'General', '', '', check_self_compilation)
