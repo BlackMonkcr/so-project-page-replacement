@@ -288,7 +288,7 @@ uint64_t S_IRUSR_IWUSR_IRGRP_IROTH = 420;
 uint64_t S_IRUSR_IWUSR_IXUSR_IRGRP_IXGRP_IROTH_IXOTH = 493;
 
 // ------------------------ GLOBAL VARIABLES -----------------------
-
+uint64_t global_ctr = 0;
 uint64_t number_of_written_characters = 0;
 
 char *output_name = (char *)0;
@@ -1307,9 +1307,6 @@ void implement_brk(uint64_t *context);
 void emit_get_pid();
 void implement_get_pid(uint64_t *context);
 
-void emit_sched();
-void implement_sched(uint64_t *context);
-
 void emit_fork();
 void implement_fork(uint64_t *context);
 
@@ -1318,6 +1315,12 @@ void implement_lock(uint64_t *context);
 
 void emit_unlock();
 void implement_unlock(uint64_t *context);
+
+void emit_sched();
+void implement_sched(uint64_t *context);
+
+void emit_tick();
+void implement_tick(uint64_t *context);
 
 uint64_t is_boot_level_zero();
 
@@ -1338,6 +1341,7 @@ uint64_t SYSCALL_SCHED = 27;
 uint64_t SYSCALL_FORK = 23;
 uint64_t SYSCALL_LOCK = 31;
 uint64_t SYSCALL_UNLOCK = 32;
+uint64_t SYSCALL_TICK = 4;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -6891,6 +6895,8 @@ void selfie_compile()
   emit_lock();
   emit_unlock();
 
+  emit_tick();
+
   if (GC_ON)
   {
     emit_fetch_stack_pointer();
@@ -8417,6 +8423,28 @@ void implement_unlock(uint64_t *context)
   }
   set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
 }
+
+
+
+void emit_tick()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("tick"),
+                            0, PROCEDURE, UINT64_T, 0, code_size);
+
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_TICK);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_tick(uint64_t *context)
+{
+  *(get_regs(context)+REG_A0) = global_ctr;
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+}
+
 
 
 void emit_read()
@@ -11112,11 +11140,10 @@ void do_ecall()
     }
     else if (*(registers + REG_A7) == SYSCALL_LOCK){}
     else if (*(registers + REG_A7) == SYSCALL_UNLOCK){}
-    else if (*(registers + REG_A7) == SYSCALL_SCHED)
-    {
+    else if (*(registers + REG_A7) == SYSCALL_SCHED){}
+    else if (*(registers + REG_A7) == SYSCALL_TICK){
       write_register(REG_A0);
-    }
-    else 
+    } else 
     {
       if (*(registers + REG_A7) != SYSCALL_EXIT)
       {
@@ -11810,6 +11837,7 @@ void interrupt()
   if (timer != TIMEROFF)
   {
     timer = timer - 1;
+    global_ctr = global_ctr+1;
 
     if (timer == 0)
     {
@@ -12935,6 +12963,8 @@ uint64_t handle_system_call(uint64_t *context)
     implement_unlock(context);
   else if (a7 == SYSCALL_SCHED)
     implement_sched(context);
+  else if (a7 == SYSCALL_TICK)
+    implement_tick(context);
   else
   {
     printf("%s: unknown system call %lu\n", selfie_name, a7);
