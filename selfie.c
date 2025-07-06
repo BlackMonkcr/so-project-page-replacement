@@ -288,6 +288,21 @@ uint64_t S_IRUSR_IWUSR_IRGRP_IROTH = 420;
 uint64_t S_IRUSR_IWUSR_IXUSR_IRGRP_IXGRP_IROTH_IXOTH = 493;
 
 // ------------------------ GLOBAL VARIABLES -----------------------
+
+// --- NEW ---
+
+// Dirección de inicio del primer bloque de memoria asignado para frames
+uint64_t page_frame_memory_start = 0;
+
+// Cantidad total de frames que han sido asignados por palloc
+// Lo usaremos para saber el tamaño de nuestro "buffer circular"
+uint64_t total_page_frames_allocated = 0;
+
+// Índice para nuestro puntero circular. Apunta al próximo frame a reemplazar.
+uint64_t victim_frame_index = 0;
+
+// ---
+
 uint64_t global_ctr = 0;
 uint64_t number_of_written_characters = 0;
 
@@ -298,7 +313,7 @@ char *output_buffer = (char *)0;
 uint64_t output_cursor = 0; // cursor for output buffer
 
 uint64_t SCHED_CLASS = (uint64_t)0; // RR as default
-uint64_t LOCK_OWNER = (uint64_t)-1; 
+uint64_t LOCK_OWNER = (uint64_t)-1;
 // ------------------------- INITIALIZATION ------------------------
 
 void init_library()
@@ -2412,7 +2427,7 @@ void save_context(uint64_t *context);
 
 uint64_t lowest_page(uint64_t page, uint64_t lo);
 uint64_t highest_page(uint64_t page, uint64_t hi);
-void map_page(uint64_t *context, uint64_t page, uint64_t frame);
+void map_page(uint64_t *context, uint64_t page, uint64_t frame, uint64_t is_replacement);
 
 void restore_region(uint64_t *context, uint64_t *table, uint64_t *parent_table, uint64_t lo, uint64_t hi);
 void restore_context(uint64_t *context);
@@ -8275,7 +8290,7 @@ void emit_get_pid()
 void implement_get_pid(uint64_t *context)
 {
   *(get_regs(context)+REG_A0) = get_id(context);
-  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);
 }
 
 
@@ -8297,7 +8312,7 @@ void emit_sched()
 void implement_sched(uint64_t *context)
 {
   SCHED_CLASS = *(get_regs(context)+REG_A0);
-  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);
 }
 
 void emit_lock()
@@ -8334,7 +8349,7 @@ void implement_fork(uint64_t *context){
   uint64_t end;
   uint64_t *parent_pt;
 
-  // 1. new context 
+  // 1. new context
   child_c = create_context(MY_CONTEXT, 0);
   set_lowest_lo_page(child_c, get_lowest_lo_page(context));
   set_highest_lo_page(child_c, get_highest_lo_page(context));
@@ -8343,7 +8358,7 @@ void implement_fork(uint64_t *context){
 
   set_code_seg_start(child_c, get_code_seg_start(context));
   set_code_seg_size(child_c, get_code_seg_size(context));
-  
+
   set_data_seg_start(child_c, get_data_seg_start(context));
   set_data_seg_size(child_c, get_data_seg_size(context));
 
@@ -8375,7 +8390,7 @@ void implement_fork(uint64_t *context){
       map_and_store(child_c, bgn, load_virtual_memory(parent_pt, bgn));
     bgn = bgn + WORDSIZE;
   }
-  
+
   bgn = get_virtual_address_of_page_start(get_lowest_hi_page(context));
   end = HIGHESTVIRTUALADDRESS;
   while (bgn<end){
@@ -8398,7 +8413,7 @@ void implement_lock(uint64_t *context)
   if (LOCK_OWNER == DEFAULT_LOCK_OWNER)
   {
     LOCK_OWNER = get_id(context);
-    set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+    set_pc(context,get_pc(context)+INSTRUCTIONSIZE);
   }
 }
 
@@ -8421,7 +8436,7 @@ void implement_unlock(uint64_t *context)
   {
     LOCK_OWNER = DEFAULT_LOCK_OWNER;
   }
-  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);
 }
 
 
@@ -8442,7 +8457,7 @@ void emit_tick()
 void implement_tick(uint64_t *context)
 {
   *(get_regs(context)+REG_A0) = global_ctr;
-  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);
 }
 
 
@@ -11143,7 +11158,7 @@ void do_ecall()
     else if (*(registers + REG_A7) == SYSCALL_SCHED){}
     else if (*(registers + REG_A7) == SYSCALL_TICK){
       write_register(REG_A0);
-    } else 
+    } else
     {
       if (*(registers + REG_A7) != SYSCALL_EXIT)
       {
@@ -12115,7 +12130,7 @@ void print_profile()
           percentage_format_fractional_2(PHYSICALMEMORYSIZE, pused()),
           PHYSICALMEMORYSIZE / MEGABYTE);
   }
-  
+
   down_load_profiles();
 
   context = used_contexts;
@@ -12277,7 +12292,7 @@ void init_context(uint64_t *context, uint64_t *parent, uint64_t *vctxt)
     // pointing to 4KB leaf nodes (page tables) that
     // each accommodate 2^9 (2^12 / 2^3) leaf PTEs
     set_pt(context, zmalloc(NUMBEROFPAGES / NUMBEROFLEAFPTES * sizeof(uint64_t *)));
-  
+
   set_id(context, gen_id); gen_id = gen_id+1;
   // reset page table cache
   set_lowest_lo_page(context, 0);
@@ -12472,7 +12487,7 @@ uint64_t highest_page(uint64_t page, uint64_t hi)
     return hi;
 }
 
-void map_page(uint64_t *context, uint64_t page, uint64_t frame)
+void map_page(uint64_t *context, uint64_t page, uint64_t frame, uint64_t is_replacement)
 {
   uint64_t *table;
 
@@ -12484,16 +12499,18 @@ void map_page(uint64_t *context, uint64_t page, uint64_t frame)
     {
       set_PTE_for_page(table, page, frame);
 
-      // exploit spatial locality in page table caching
-      if (page <= get_page_of_virtual_address(get_program_break(context) - WORDSIZE))
-      {
-        set_lowest_lo_page(context, lowest_page(page, get_lowest_lo_page(context)));
-        set_highest_lo_page(context, highest_page(page, get_highest_lo_page(context)));
-      }
-      else
-      {
-        set_lowest_hi_page(context, lowest_page(page, get_lowest_hi_page(context)));
-        set_highest_hi_page(context, highest_page(page, get_highest_hi_page(context)));
+      if (!is_replacement) {
+        // exploit spatial locality in page table caching
+        if (page <= get_page_of_virtual_address(get_program_break(context) - WORDSIZE))
+        {
+          set_lowest_lo_page(context, lowest_page(page, get_lowest_lo_page(context)));
+          set_highest_lo_page(context, highest_page(page, get_highest_lo_page(context)));
+        }
+        else
+        {
+          set_lowest_hi_page(context, lowest_page(page, get_lowest_hi_page(context)));
+          set_highest_hi_page(context, highest_page(page, get_highest_hi_page(context)));
+        }
       }
     } // else assert: frame == get_frame_for_page(table, page)
   }
@@ -12513,7 +12530,7 @@ void restore_region(uint64_t *context, uint64_t *table, uint64_t *parent_table, 
     {
       frame = load_virtual_memory(parent_table, (uint64_t)get_PTE_address_for_page(parent_table, table, lo));
 
-      map_page(context, lo, get_frame_for_page(parent_table, get_page_of_virtual_address(frame)));
+      map_page(context, lo, get_frame_for_page(parent_table, get_page_of_virtual_address(frame)), 0);
     }
 
     lo = lo + 1;
@@ -12752,6 +12769,15 @@ uint64_t *palloc()
       // page frames must be page-aligned to work as page table index
       next_page_frame = round_up(block, PAGESIZE * double_for_single_word);
 
+      // -- NEW --
+
+      // Si es la primera vez que asignamos memoria para frames, guardamos la dirección de inicio.
+      if (page_frame_memory_start == 0) {
+        page_frame_memory_start = next_page_frame;
+      }
+
+      // ---
+
       if (next_page_frame > block)
         // losing one page frame to fragmentation
         free_page_frame_memory = free_page_frame_memory - PAGESIZE * double_for_single_word;
@@ -12770,6 +12796,13 @@ uint64_t *palloc()
 
   free_page_frame_memory = free_page_frame_memory - PAGESIZE * double_for_single_word;
 
+  // -- NEW --
+
+  // Incrementamos el contador de frames cada vez que palloc tiene éxito
+  total_page_frames_allocated++;
+
+  // ---
+
   // strictly, touching is only necessary on boot levels higher than 0
   return touch((uint64_t *)frame, PAGESIZE * double_for_single_word);
 }
@@ -12785,7 +12818,7 @@ void map_and_store(uint64_t *context, uint64_t vaddr, uint64_t data)
   // assert: is_virtual_address_valid(vaddr, WORDSIZE) == 1
 
   if (is_virtual_address_mapped(get_pt(context), vaddr) == 0)
-    map_page(context, get_page_of_virtual_address(vaddr), (uint64_t)palloc());
+    map_page(context, get_page_of_virtual_address(vaddr), (uint64_t)palloc(), 0);
 
   store_virtual_memory(get_pt(context), vaddr, data);
 }
@@ -12977,20 +13010,42 @@ uint64_t handle_system_call(uint64_t *context)
   return DONOTEXIT;
 }
 
+// Encuentra la página virtual que está mapeada a un frame específico y anula su mapeo.
+// Retorna la página encontrada o 0 si no se encuentra.
+uint64_t unmap_page_for_frame(uint64_t *context, uint64_t frame) {
+    uint64_t* table = get_pt(context);
+    uint64_t  page;
+
+    // La tabla de páginas tiene un tamaño máximo (NUM_PAGES)
+    for (page = 0; page < VIRTUALMEMORYSIZE / PAGESIZE; page++) {
+        if (get_frame_for_page(table, page) == frame) {
+            // Encontrado. Invalida la entrada en la tabla de páginas (mapeándola a 0)
+            set_PTE_for_page(table, page, 0);
+
+            // Opcional: imprimir para depuración
+            printf("%s: unmapping page 0x%lX from frame 0x%lX\n", selfie_name, page, frame);
+
+            return page; // Retornamos la página que fue desmapeada
+        }
+    }
+
+    return 0; // No se encontró ninguna página mapeada a este frame
+}
+
 uint64_t handle_page_fault(uint64_t *context)
 {
   uint64_t page;
 
   set_exception(context, EXCEPTION_NOEXCEPTION);
-
   set_ec_page_fault(context, get_ec_page_fault(context) + 1);
 
   page = get_fault(context);
 
   if (pavailable())
   {
-    // TODO: reuse frames
-    map_page(context, page, (uint64_t)palloc());
+    // --- LÓGICA DE ASIGNACIÓN NORMAL ---
+    // palloc() se encarga de todo, incluyendo el incremento de nuestro contador total_page_frames_allocated
+    map_page(context, page, (uint64_t)palloc(), 0);
 
     if (is_heap_address(context, get_virtual_address_of_page_start(page)))
       set_mc_mapped_heap(context, get_mc_mapped_heap(context) + PAGESIZE);
@@ -12999,11 +13054,29 @@ uint64_t handle_page_fault(uint64_t *context)
   }
   else
   {
-    printf("%s: page fault at 0x%lX out of physical memory\n", selfie_name, page);
+    // --- LÓGICA DE REEMPLAZO FCFS (VERSIÓN SIMPLE POC) ---
+    printf("%s: page fault at 0x%lX requires replacement.\n", selfie_name, page);
 
-    set_exit_code(context, EXITCODE_OUTOFPHYSICALMEMORY);
+    // 1. Calcular la dirección del frame víctima
+    // Nos movemos desde el inicio de la memoria de frames, un número de "saltos" de tamaño de página
+    uint64_t double_for_single_word = sizeof(uint64_t) / WORDSIZE;
+    uint64_t victim_frame_address = page_frame_memory_start + (victim_frame_index * PAGESIZE * double_for_single_word);
 
-    return EXIT;
+    printf("%s: replacing frame at address 0x%lX (index %lu).\n", selfie_name, victim_frame_address, victim_frame_index);
+
+    // 2. Invalidar el mapeo antiguo (página -> frame víctima)
+    unmap_page_for_frame(context, victim_frame_address);
+
+    // 3. Mapear la nueva página al frame reciclado
+    map_page(context, page, victim_frame_address, 1); // 1 indica que es un reemplazo
+
+    // 4. Avanzar el índice de la víctima de forma circular
+    victim_frame_index = (victim_frame_index + 1) % total_page_frames_allocated;
+
+    if (is_heap_address(context, get_virtual_address_of_page_start(page)))
+      set_mc_mapped_heap(context, get_mc_mapped_heap(context) + PAGESIZE);
+
+    return DONOTEXIT; // ¡Continuamos la ejecución!
   }
 }
 
@@ -13094,7 +13167,7 @@ uint64_t mipster(uint64_t *to_context)
         //to_context = get_next_context(from_context);
         if (to_context == (uint64_t *)0)
           to_context = used_contexts;
-      } else 
+      } else
       { // when is Priority Scheduler
 
       }
@@ -13242,7 +13315,7 @@ void map_unmapped_pages(uint64_t *context)
 
   while (pavailable())
   {
-    map_page(context, page, (uint64_t)palloc());
+    map_page(context, page, (uint64_t)palloc(), 0);
 
     page = page + 1;
   }
@@ -13541,7 +13614,7 @@ uint64_t selfie_run_mipsterOS(uint64_t machine)
     boot_loader(current_context);
     number = number-1;
   }
-  
+
 
   run = 1;
 
@@ -13711,7 +13784,7 @@ uint64_t selfie(uint64_t extras)
       {
         if (string_compare(argument, "-m"))
           return selfie_run(MIPSTER);
-        else if (string_compare(argument, "-x")) 
+        else if (string_compare(argument, "-x"))
           return selfie_run_mipsterOS(MIPSTER);
         else if (string_compare(argument, "-d"))
           return selfie_run(DIPSTER);
