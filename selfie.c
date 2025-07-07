@@ -289,20 +289,6 @@ uint64_t S_IRUSR_IWUSR_IXUSR_IRGRP_IXGRP_IROTH_IXOTH = 493;
 
 // ------------------------ GLOBAL VARIABLES -----------------------
 
-// --- NEW ---
-
-// Dirección de inicio del primer bloque de memoria asignado para frames
-uint64_t page_frame_memory_start = 0;
-
-// Cantidad total de frames que han sido asignados por palloc
-// Lo usaremos para saber el tamaño de nuestro "buffer circular"
-uint64_t total_page_frames_allocated = 0;
-
-// Índice para nuestro puntero circular. Apunta al próximo frame a reemplazar.
-uint64_t victim_frame_index = 0;
-
-// ---
-
 uint64_t global_ctr = 0;
 uint64_t number_of_written_characters = 0;
 
@@ -1596,10 +1582,38 @@ uint64_t HIGHESTVIRTUALADDRESS = 4294967288; // VIRTUALMEMORYSIZE * GIGABYTE - W
 // host-dependent, see init_memory()
 uint64_t NUMBEROFLEAFPTES = 512; // number of leaf page table entries == PAGESIZE / sizeof(uint64_t*)
 
+// --- NEW ---
+uint64_t PAGE_NOT_FOUND = (uint64_t)-1; // Value indicating that a page is not found in the page table
+uint64_t NUMBER_OF_FRAMES = 0; // number of frames in physical memory
+uint64_t* frame_replacement_queue; // queue for frame replacement, used by FCFS
+uint64_t frames_in_queue = 0; // number of frames in the queue
+uint64_t next_victim_index = 0; // index of the next victim frame to be replaced
+uint64_t total_count_page_replacements = 0; // total number of page replacements
+
+// --- SWAPPING ---
+uint64_t* swap_space; // Simulate swap space in memory.
+uint64_t MAX_SWAPPED_PAGES = 2048; // Size of swap space in pages (4096 bytes each).
+
+uint64_t SWAP_SLOT_NOT_FOUND = 2048; // Value indicating that a page is not in swap space.
+
+// A map to know where each swapped page is located.
+// Index: virtual page number.
+// Value: index of the slot in swap_space, or -1 if not in swap.
+uint64_t* swap_map;
+
+// A bitmap to quickly find a free slot in swap_space.
+// 1 if the slot is free, 0 if it's occupied.
+uint64_t* free_swap_slots_bitmap;
+
+uint64_t total_count_page_outs = 0; // Pages swapped out to disk
+uint64_t total_count_page_ins = 0;  // Pages swapped in from disk
+// ---
+
 // ------------------------- INITIALIZATION ------------------------
 
 void init_memory(uint64_t megabytes)
 {
+  uint64_t i;
   if (megabytes < 1)
     megabytes = 1;
   else if (megabytes > 4096)
@@ -1609,6 +1623,34 @@ void init_memory(uint64_t megabytes)
 
   // host-dependent: reinitialize in case sizeof(uint64_t*) is not 8
   NUMBEROFLEAFPTES = PAGESIZE / sizeof(uint64_t *);
+
+  // --- NEW ---
+  NUMBER_OF_FRAMES = (PHYSICALMEMORYSIZE * (sizeof(uint64_t) / WORDSIZE)) / PAGESIZE;
+  frame_replacement_queue = smalloc(NUMBER_OF_FRAMES * sizeof(uint64_t));
+
+  // -- SWAPPING ---
+  // 1. Reservar memoria para el espacio de swap
+  swap_space = smalloc(MAX_SWAPPED_PAGES * PAGESIZE);
+
+  // 2. Reservar memoria para el mapa de swap. Necesita una entrada por cada página virtual posible.
+  swap_map = smalloc(NUMBEROFPAGES * sizeof(uint64_t));
+
+  // 3. Reservar memoria para el bitmap de slots libres
+  free_swap_slots_bitmap = smalloc(MAX_SWAPPED_PAGES * sizeof(uint64_t));
+
+  // 4. Inicializar las estructuras
+  i = 0;
+  while (i < NUMBEROFPAGES) {
+    *(swap_map + i) = SWAP_SLOT_NOT_FOUND; // -1 significa "no está en swap"
+    i = i + 1;
+  }
+
+  i = 0;
+  while (i < MAX_SWAPPED_PAGES) {
+    *(free_swap_slots_bitmap + i) = 1; // 1 significa "slot libre"
+    i = i + 1;
+  }
+  // ---
 }
 
 // -----------------------------------------------------------------
@@ -2534,6 +2576,7 @@ uint64_t EXITCODE_UNKNOWNSYSCALL = 24;
 uint64_t EXITCODE_UNSUPPORTEDSYSCALL = 25;
 uint64_t EXITCODE_MULTIPLEEXCEPTIONERROR = 26;
 uint64_t EXITCODE_UNCAUGHTEXCEPTION = 27;
+uint64_t EXITCODE_OUTOFSWAPSPACE = 28;
 
 uint64_t SYSCALL_BITWIDTH = 32; // integer bit width for system calls
 
@@ -12107,12 +12150,44 @@ void print_instruction_versus_exception_profile(uint64_t *parent_context)
            ratio_format_fractional_2(get_ic_all(parent_context), ic_count));
 }
 
+// Cuenta el número de slots de swap actualmente ocupados.
+uint64_t get_used_swap_slots() {
+    uint64_t used_slots;
+    uint64_t i;
+
+    used_slots = 0;
+    i = 0;
+
+    // Si no se configuró swap, no hay nada que contar.
+    if (MAX_SWAPPED_PAGES == 0) {
+        return 0;
+    }
+
+    // Recorre el bitmap y cuenta los slots ocupados (los que tienen valor 0).
+    while (i < MAX_SWAPPED_PAGES) {
+        if (*(free_swap_slots_bitmap + i) == 0) {
+            used_slots = used_slots + 1;
+        }
+        i = i + 1;
+    }
+
+    return used_slots;
+}
+
 void print_profile()
 {
   uint64_t *context;
 
   printf("%s: --------------------------------------------------------------------------------\n", selfie_name);
-  printf("%s: summary: ", selfie_name);
+  printf("%s: summary:\n", selfie_name);
+  printf("%s: Page Replacement & Swapping:\n", selfie_name);
+  printf("%s: %lu page replacements have occurred.\n", selfie_name, total_count_page_replacements);
+  printf("%s: %lu space in the queue has been used for page replacement.\n", selfie_name, NUMBER_OF_FRAMES);
+  printf("%s: %lu total swap slots configured.\n", selfie_name, MAX_SWAPPED_PAGES);
+  printf("%s: %lu swap slots currently used.\n", selfie_name, get_used_swap_slots());
+  printf("%s: %lu total page-outs (to swap).\n", selfie_name, total_count_page_outs);
+  printf("%s: %lu total page-ins (from swap).\n", selfie_name, total_count_page_ins);
+
   if (0==1)
   {
     if (get_total_number_of_instructions() > 0)
@@ -12499,7 +12574,7 @@ void map_page(uint64_t *context, uint64_t page, uint64_t frame, uint64_t is_repl
     {
       set_PTE_for_page(table, page, frame);
 
-      if (!is_replacement) {
+      if (is_replacement == 0) {
         // exploit spatial locality in page table caching
         if (page <= get_page_of_virtual_address(get_program_break(context) - WORDSIZE))
         {
@@ -12738,6 +12813,14 @@ uint64_t pavailable()
     return 0;
 }
 
+uint64_t pavailable_mod()
+{
+  if (frames_in_queue < NUMBER_OF_FRAMES)
+    return 1;
+  else
+    return 0;
+}
+
 uint64_t pused()
 {
   return allocated_page_frame_memory - free_page_frame_memory;
@@ -12769,15 +12852,6 @@ uint64_t *palloc()
       // page frames must be page-aligned to work as page table index
       next_page_frame = round_up(block, PAGESIZE * double_for_single_word);
 
-      // -- NEW --
-
-      // Si es la primera vez que asignamos memoria para frames, guardamos la dirección de inicio.
-      if (page_frame_memory_start == 0) {
-        page_frame_memory_start = next_page_frame;
-      }
-
-      // ---
-
       if (next_page_frame > block)
         // losing one page frame to fragmentation
         free_page_frame_memory = free_page_frame_memory - PAGESIZE * double_for_single_word;
@@ -12795,13 +12869,6 @@ uint64_t *palloc()
   next_page_frame = next_page_frame + PAGESIZE * double_for_single_word;
 
   free_page_frame_memory = free_page_frame_memory - PAGESIZE * double_for_single_word;
-
-  // -- NEW --
-
-  // Incrementamos el contador de frames cada vez que palloc tiene éxito
-  total_page_frames_allocated++;
-
-  // ---
 
   // strictly, touching is only necessary on boot levels higher than 0
   return touch((uint64_t *)frame, PAGESIZE * double_for_single_word);
@@ -13010,15 +13077,19 @@ uint64_t handle_system_call(uint64_t *context)
   return DONOTEXIT;
 }
 
+// --- NEW ---
 // Encuentra la página virtual que está mapeada a un frame específico y anula su mapeo.
 // Retorna la página encontrada o 0 si no se encuentra.
 uint64_t unmap_page_for_frame(uint64_t *context, uint64_t frame) {
-    uint64_t* table = get_pt(context);
+    uint64_t* table;
     uint64_t  page;
 
+    table = get_pt(context);
+
     // La tabla de páginas tiene un tamaño máximo (NUM_PAGES)
-    for (page = 0; page < VIRTUALMEMORYSIZE / PAGESIZE; page++) {
-        if (get_frame_for_page(table, page) == frame) {
+    page = 0;
+    while (page < NUMBEROFPAGES) {
+      if (get_frame_for_page(table, page) == frame) {
             // Encontrado. Invalida la entrada en la tabla de páginas (mapeándola a 0)
             set_PTE_for_page(table, page, 0);
 
@@ -13027,57 +13098,204 @@ uint64_t unmap_page_for_frame(uint64_t *context, uint64_t frame) {
 
             return page; // Retornamos la página que fue desmapeada
         }
+        page = page + 1;
     }
 
-    return 0; // No se encontró ninguna página mapeada a este frame
+    return PAGE_NOT_FOUND; // No se encontró ninguna página mapeada a este frame
 }
+
+// -- SWAPPING --
+// Encuentra un slot libre en el espacio de swap y lo marca como ocupado.
+// Retorna el índice del slot o -1 si no hay espacio.
+uint64_t find_free_swap_slot() {
+  uint64_t i;
+  i = 0;
+  while (i < MAX_SWAPPED_PAGES) {
+    if (*(free_swap_slots_bitmap + i) == 1) {
+      *(free_swap_slots_bitmap + i) = 0; // Marcar como ocupado
+      return i;
+    }
+    i = i + 1;
+  }
+  return SWAP_SLOT_NOT_FOUND; // ¡No hay espacio en el swap!
+}
+
+// Guarda el contenido de un frame físico en un slot del swap.
+// Versión que solo utiliza uint64_t*.
+void swap_out(uint64_t frame_to_save, uint64_t swap_slot_index) {
+  uint64_t* frame_ptr;
+  uint64_t* swap_slot_ptr;
+  uint64_t i;
+  uint64_t words_per_page;
+
+  // 1. Calcula cuántos uint64_t (palabras de 64 bits) hay en una página.
+  // PAGESIZE es en bytes (4096). sizeof(uint64_t) es 8 bytes.
+  // words_per_page será 4096 / 8 = 512.
+  words_per_page = PAGESIZE / sizeof(uint64_t);
+
+  // 2. Apunta al inicio del frame físico.
+  frame_ptr = (uint64_t*) frame_to_save;
+
+  // 3. Calcula la dirección de inicio del slot de swap.
+  // La aritmética de punteros ya se encarga de multiplicar por sizeof(uint64_t).
+  // Por eso, el offset total es: slot_índice * palabras_por_página.
+  swap_slot_ptr = swap_space + (swap_slot_index * words_per_page);
+
+  // 4. Copia el número correcto de palabras de 64 bits.
+  i = 0;
+  while (i < words_per_page) {
+    *(swap_slot_ptr + i) = *(frame_ptr + i);
+    i = i + 1;
+  }
+
+  total_count_page_outs = total_count_page_outs + 1;
+}
+
+
+// Restaura el contenido de un slot del swap a un frame físico.
+// Versión que solo utiliza uint64_t*.
+void swap_in(uint64_t swap_slot_index, uint64_t target_frame) {
+  uint64_t* frame_ptr;
+  uint64_t* swap_slot_ptr;
+  uint64_t i;
+  uint64_t words_per_page;
+
+  // 1. Calcula cuántos uint64_t hay en una página.
+  words_per_page = PAGESIZE / sizeof(uint64_t);
+
+  // 2. Apunta al inicio del frame físico destino.
+  frame_ptr = (uint64_t*) target_frame;
+
+  // 3. Calcula la dirección de inicio del slot de swap de origen.
+  swap_slot_ptr = swap_space + (swap_slot_index * words_per_page);
+
+  // 4. Copia el número correcto de palabras de 64 bits desde el swap al frame.
+  i = 0;
+  while (i < words_per_page) {
+    *(frame_ptr + i) = *(swap_slot_ptr + i);
+    i = i + 1;
+  }
+
+  // Liberar el slot de swap
+  *(free_swap_slots_bitmap + swap_slot_index) = 1;
+  total_count_page_ins = total_count_page_ins + 1;
+}
+// ---
 
 uint64_t handle_page_fault(uint64_t *context)
 {
   uint64_t page;
+  uint64_t new_frame;
+  uint64_t victim_frame;
+  uint64_t swap_slot;
+  uint64_t victim_page;
+  uint64_t free_slot;
 
   set_exception(context, EXCEPTION_NOEXCEPTION);
   set_ec_page_fault(context, get_ec_page_fault(context) + 1);
 
   page = get_fault(context);
+  swap_slot = *(swap_map + page);
 
-  if (pavailable())
-  {
-    // --- LÓGICA DE ASIGNACIÓN NORMAL ---
-    // palloc() se encarga de todo, incluyendo el incremento de nuestro contador total_page_frames_allocated
-    map_page(context, page, (uint64_t)palloc(), 0);
+    // --- LÓGICA DE SWAPPING ---
+  if (swap_slot != SWAP_SLOT_NOT_FOUND) {
+    // CASO 1: La página está en el swap (PAGE-IN)
+    printf("%s: page fault on 0x%lX, found in swap slot %lu. Paging in.\n", selfie_name, page, swap_slot);
 
-    if (is_heap_address(context, get_virtual_address_of_page_start(page)))
+    // Necesitamos un frame para cargar la página. La lógica es la misma:
+    // o hay uno libre, o reemplazamos uno existente.
+    if (pavailable_mod()) {
+        // Hay un frame físico libre, ¡genial!
+        new_frame = (uint64_t)palloc();
+        *(frame_replacement_queue + frames_in_queue) = new_frame;
+        frames_in_queue = frames_in_queue + 1;
+
+    } else {
+        // No hay frames libres, tenemos que reemplazar (PAGE-OUT + PAGE-IN)
+        // 1. Elegir víctima con FCFS
+        victim_frame = *(frame_replacement_queue + next_victim_index);
+        printf("%s: replacing frame at address 0x%lX (queue index %lu).\n", selfie_name, victim_frame, next_victim_index);
+
+        // 2. Encontrar la página virtual de la víctima para poder hacerle swap-out
+        victim_page = unmap_page_for_frame(context, victim_frame);
+
+        if (victim_page != PAGE_NOT_FOUND) {
+            // 3. ¡Guardar la víctima en el swap ANTES de sobreescribirla! (PAGE-OUT)
+            free_slot = find_free_swap_slot();
+            if (free_slot == SWAP_SLOT_NOT_FOUND) {
+                printf("%s: Out of swap space! Cannot replace page.\n", selfie_name);
+                set_exit_code(context, EXITCODE_OUTOFSWAPSPACE); // Necesitarías un nuevo código de error
+                return EXIT;
+            }
+            printf("%s: swapping out victim page 0x%lX to swap slot %lu\n", selfie_name, victim_page, free_slot);
+            swap_out(victim_frame, free_slot);
+            *(swap_map + victim_page) = free_slot; // Registrar que la víctima está ahora en swap
+        }
+
+        // 4. Ahora el frame víctima está libre para ser usado
+        new_frame = victim_frame;
+        // La cola de reemplazo FCFS no se toca, solo el puntero.
+        next_victim_index = (next_victim_index + 1) % NUMBER_OF_FRAMES;
+    }
+
+    // 5. Cargar la página desde el swap al frame destino (PAGE-IN)
+    swap_in(swap_slot, new_frame);
+
+    // 6. Mapear la página al frame
+    map_page(context, page, new_frame, pavailable_mod() != 0);
+
+    // 7. Actualizar el estado del swap_map
+    *(swap_map + page) = SWAP_SLOT_NOT_FOUND; // La página ya no está en swap
+
+  } else {
+    // CASO 2: Fallo de página "fresco" (no está en swap)
+    // Esta parte es muy similar a tu código original, pero con el añadido del page-out.
+
+    if (pavailable_mod()) {
+        // --- FASE DE LLENADO DE MEMORIA (sin cambios) ---
+        new_frame = (uint64_t)palloc();
+        map_page(context, page, new_frame, 0);
+        *(frame_replacement_queue + frames_in_queue) = new_frame;
+        frames_in_queue = frames_in_queue + 1;
+
+    } else {
+        // --- FASE DE REEMPLAZO (con PAGE-OUT) ---
+        printf("%s: page fault at 0x%lX requires replacement.\n", selfie_name, page);
+
+        // 1. Obtener el frame víctima
+        victim_frame = *(frame_replacement_queue + next_victim_index);
+        printf("%s: replacing frame at address 0x%lX (queue index %lu).\n", selfie_name, victim_frame, next_victim_index);
+
+        // 2. Invalidar y encontrar la página víctima
+        victim_page = unmap_page_for_frame(context, victim_frame);
+
+        if (victim_page != PAGE_NOT_FOUND) {
+            // 3. ¡Guardar la víctima en el swap! (PAGE-OUT)
+            free_slot = find_free_swap_slot();
+            if (free_slot == SWAP_SLOT_NOT_FOUND) {
+                printf("%s: Out of swap space! Cannot replace page.\n", selfie_name);
+                set_exit_code(context, EXITCODE_OUTOFSWAPSPACE);
+                return EXIT;
+            }
+            printf("%s: swapping out victim page 0x%lX to swap slot %lu\n", selfie_name, victim_page, free_slot);
+            swap_out(victim_frame, free_slot);
+            *(swap_map + victim_page) = free_slot;
+        }
+
+        // 4. Mapear la NUEVA página al frame reciclado
+        map_page(context, page, victim_frame, 1);
+
+        // 5. Avanzar el puntero de la víctima
+        next_victim_index = (next_victim_index + 1) % NUMBER_OF_FRAMES;
+        total_count_page_replacements = total_count_page_replacements + 1;
+    }
+  }
+
+  // Código común para ambos casos (actualizar contadores de heap, etc.)
+  if (is_heap_address(context, get_virtual_address_of_page_start(page)))
       set_mc_mapped_heap(context, get_mc_mapped_heap(context) + PAGESIZE);
 
-    return DONOTEXIT;
-  }
-  else
-  {
-    // --- LÓGICA DE REEMPLAZO FCFS (VERSIÓN SIMPLE POC) ---
-    printf("%s: page fault at 0x%lX requires replacement.\n", selfie_name, page);
-
-    // 1. Calcular la dirección del frame víctima
-    // Nos movemos desde el inicio de la memoria de frames, un número de "saltos" de tamaño de página
-    uint64_t double_for_single_word = sizeof(uint64_t) / WORDSIZE;
-    uint64_t victim_frame_address = page_frame_memory_start + (victim_frame_index * PAGESIZE * double_for_single_word);
-
-    printf("%s: replacing frame at address 0x%lX (index %lu).\n", selfie_name, victim_frame_address, victim_frame_index);
-
-    // 2. Invalidar el mapeo antiguo (página -> frame víctima)
-    unmap_page_for_frame(context, victim_frame_address);
-
-    // 3. Mapear la nueva página al frame reciclado
-    map_page(context, page, victim_frame_address, 1); // 1 indica que es un reemplazo
-
-    // 4. Avanzar el índice de la víctima de forma circular
-    victim_frame_index = (victim_frame_index + 1) % total_page_frames_allocated;
-
-    if (is_heap_address(context, get_virtual_address_of_page_start(page)))
-      set_mc_mapped_heap(context, get_mc_mapped_heap(context) + PAGESIZE);
-
-    return DONOTEXIT; // ¡Continuamos la ejecución!
-  }
+  return DONOTEXIT;
 }
 
 uint64_t handle_division_by_zero(uint64_t *context)
