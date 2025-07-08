@@ -13185,113 +13185,98 @@ void swap_in(uint64_t swap_slot_index, uint64_t target_frame) {
 uint64_t handle_page_fault(uint64_t *context)
 {
   uint64_t page;
-  uint64_t new_frame;
+  uint64_t target_frame;
   uint64_t victim_frame;
-  uint64_t swap_slot;
   uint64_t victim_page;
+  uint64_t swap_slot;
   uint64_t free_slot;
+  uint64_t is_replacement;
 
+  // --- Inicialización ---
   set_exception(context, EXCEPTION_NOEXCEPTION);
   set_ec_page_fault(context, get_ec_page_fault(context) + 1);
 
   page = get_fault(context);
-  swap_slot = *(swap_map + page);
+  is_replacement = 0; // Por defecto, asumimos que no es un reemplazo
 
-    // --- LÓGICA DE SWAPPING ---
-  if (swap_slot != SWAP_SLOT_NOT_FOUND) {
-    // CASO 1: La página está en el swap (PAGE-IN)
-    printf("%s: page fault on 0x%lX, found in swap slot %lu. Paging in.\n", selfie_name, page, swap_slot);
+  // ------------------------------------------------------------------
+  // PASO 1: OBTENER UN FRAME (LÓGICA UNIFICADA)
+  // ------------------------------------------------------------------
+  // No importa si la página es nueva o viene del swap, primero necesitamos
+  // asegurar un frame físico donde ponerla.
 
-    // Necesitamos un frame para cargar la página. La lógica es la misma:
-    // o hay uno libre, o reemplazamos uno existente.
-    if (pavailable_mod()) {
-        // Hay un frame físico libre, ¡genial!
-        new_frame = (uint64_t)palloc();
-        *(frame_replacement_queue + frames_in_queue) = new_frame;
+  if (pavailable_mod()) {
+    // --- Hay frames físicos disponibles ---
+    target_frame = (uint64_t)palloc();
+
+    // Añadir el nuevo frame a nuestra cola de reemplazo
+    if (frames_in_queue < NUMBER_OF_FRAMES) {
+        *(frame_replacement_queue + frames_in_queue) = target_frame;
         frames_in_queue = frames_in_queue + 1;
-
-    } else {
-        // No hay frames libres, tenemos que reemplazar (PAGE-OUT + PAGE-IN)
-        // 1. Elegir víctima con FCFS
-        victim_frame = *(frame_replacement_queue + next_victim_index);
-        printf("%s: replacing frame at address 0x%lX (queue index %lu).\n", selfie_name, victim_frame, next_victim_index);
-
-        // 2. Encontrar la página virtual de la víctima para poder hacerle swap-out
-        victim_page = unmap_page_for_frame(context, victim_frame);
-
-        if (victim_page != PAGE_NOT_FOUND) {
-            // 3. ¡Guardar la víctima en el swap ANTES de sobreescribirla! (PAGE-OUT)
-            free_slot = find_free_swap_slot();
-            if (free_slot == SWAP_SLOT_NOT_FOUND) {
-                printf("%s: Out of swap space! Cannot replace page.\n", selfie_name);
-                set_exit_code(context, EXITCODE_OUTOFSWAPSPACE); // Necesitarías un nuevo código de error
-                return EXIT;
-            }
-            printf("%s: swapping out victim page 0x%lX to swap slot %lu\n", selfie_name, victim_page, free_slot);
-            swap_out(victim_frame, free_slot);
-            *(swap_map + victim_page) = free_slot; // Registrar que la víctima está ahora en swap
-        }
-
-        // 4. Ahora el frame víctima está libre para ser usado
-        new_frame = victim_frame;
-        // La cola de reemplazo FCFS no se toca, solo el puntero.
-        next_victim_index = (next_victim_index + 1) % NUMBER_OF_FRAMES;
     }
-
-    // 5. Cargar la página desde el swap al frame destino (PAGE-IN)
-    swap_in(swap_slot, new_frame);
-
-    // 6. Mapear la página al frame
-    map_page(context, page, new_frame, pavailable_mod() != 0);
-
-    // 7. Actualizar el estado del swap_map
-    *(swap_map + page) = SWAP_SLOT_NOT_FOUND; // La página ya no está en swap
 
   } else {
-    // CASO 2: Fallo de página "fresco" (no está en swap)
-    // Esta parte es muy similar a tu código original, pero con el añadido del page-out.
+    // --- No hay frames libres, se necesita reemplazar ---
+    is_replacement = 1; // Marcamos que estamos haciendo un reemplazo
 
-    if (pavailable_mod()) {
-        // --- FASE DE LLENADO DE MEMORIA (sin cambios) ---
-        new_frame = (uint64_t)palloc();
-        map_page(context, page, new_frame, 0);
-        *(frame_replacement_queue + frames_in_queue) = new_frame;
-        frames_in_queue = frames_in_queue + 1;
+    // 1. Obtener el frame víctima con FCFS
+    victim_frame = *(frame_replacement_queue + next_victim_index);
+    printf("%s: replacement needed, victim is frame 0x%lX (queue index %lu).\n", selfie_name, victim_frame, next_victim_index);
 
-    } else {
-        // --- FASE DE REEMPLAZO (con PAGE-OUT) ---
-        printf("%s: page fault at 0x%lX requires replacement.\n", selfie_name, page);
+    // 2. Encontrar qué página virtual usaba el frame víctima
+    victim_page = unmap_page_for_frame(context, victim_frame);
 
-        // 1. Obtener el frame víctima
-        victim_frame = *(frame_replacement_queue + next_victim_index);
-        printf("%s: replacing frame at address 0x%lX (queue index %lu).\n", selfie_name, victim_frame, next_victim_index);
-
-        // 2. Invalidar y encontrar la página víctima
-        victim_page = unmap_page_for_frame(context, victim_frame);
-
-        if (victim_page != PAGE_NOT_FOUND) {
-            // 3. ¡Guardar la víctima en el swap! (PAGE-OUT)
-            free_slot = find_free_swap_slot();
-            if (free_slot == SWAP_SLOT_NOT_FOUND) {
-                printf("%s: Out of swap space! Cannot replace page.\n", selfie_name);
-                set_exit_code(context, EXITCODE_OUTOFSWAPSPACE);
-                return EXIT;
-            }
-            printf("%s: swapping out victim page 0x%lX to swap slot %lu\n", selfie_name, victim_page, free_slot);
-            swap_out(victim_frame, free_slot);
-            *(swap_map + victim_page) = free_slot;
+    if (victim_page != PAGE_NOT_FOUND) {
+        // 3. Guardar la página víctima en el swap (PAGE-OUT)
+        free_slot = find_free_swap_slot();
+        if (free_slot == SWAP_SLOT_NOT_FOUND) {
+            printf("%s: Out of swap space! Cannot replace page.\n", selfie_name);
+            set_exit_code(context, EXITCODE_OUTOFSWAPSPACE); // Necesitas este código de error
+            return EXIT;
         }
+        printf("%s: swapping out victim page 0x%lX to swap slot %lu\n", selfie_name, victim_page, free_slot);
+        swap_out(victim_frame, free_slot);
 
-        // 4. Mapear la NUEVA página al frame reciclado
-        map_page(context, page, victim_frame, 1);
-
-        // 5. Avanzar el puntero de la víctima
-        next_victim_index = (next_victim_index + 1) % NUMBER_OF_FRAMES;
-        total_count_page_replacements = total_count_page_replacements + 1;
+        // 4. Actualizar el mapa para registrar la nueva ubicación de la página víctima
+        *(swap_map + victim_page) = free_slot;
     }
+
+    // 5. El frame víctima ahora está reciclado y listo para ser nuestro frame destino
+    target_frame = victim_frame;
+
+    // 6. Avanzar el puntero de la víctima para el próximo reemplazo
+    next_victim_index = (next_victim_index + 1) % NUMBER_OF_FRAMES;
+    total_count_page_replacements = total_count_page_replacements + 1;
   }
 
-  // Código común para ambos casos (actualizar contadores de heap, etc.)
+  // ------------------------------------------------------------------
+  // PASO 2: USAR EL FRAME OBTENIDO
+  // ------------------------------------------------------------------
+  // En este punto, ya tenemos un 'target_frame' listo para usar.
+  // Ahora decidimos qué contenido poner en él.
+
+  swap_slot = *(swap_map + page);
+
+  if (swap_slot != SWAP_SLOT_NOT_FOUND) {
+    // La página que causó el fallo estaba en el swap. La traemos de vuelta (PAGE-IN).
+    printf("%s: page 0x%lX found in swap slot %lu. Paging in.\n", selfie_name, page, swap_slot);
+    swap_in(swap_slot, target_frame);
+
+    // Actualizamos el mapa para indicar que la página ya no está en swap.
+    *(swap_map + page) = SWAP_SLOT_NOT_FOUND;
+
+  } // else: La página era nueva (un "fallo duro"). El frame ya está listo
+    // (palloc usualmente lo devuelve lleno de ceros). No hay que hacer nada más.
+
+  // ------------------------------------------------------------------
+  // PASO 3: MAPEAR LA PÁGINA Y FINALIZAR
+  // ------------------------------------------------------------------
+
+  // Mapeamos la página que causó el fallo al frame que preparamos.
+  // Usamos nuestro flag 'is_replacement' que es 100% fiable.
+  map_page(context, page, target_frame, is_replacement);
+
+  // Código de gestión del heap (sin cambios)
   if (is_heap_address(context, get_virtual_address_of_page_start(page)))
       set_mc_mapped_heap(context, get_mc_mapped_heap(context) + PAGESIZE);
 
